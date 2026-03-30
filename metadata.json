@@ -1,0 +1,5 @@
+{
+  "name": "PackWise - Smart Travel Packing List",
+  "description": "A smart travel assistant that generates customized packing lists based on your destination, duration, and activities using AI.",
+  "requestFramePermissions": ["microphone"]
+}
