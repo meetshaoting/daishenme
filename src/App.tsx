@@ -3,24 +3,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   Mic, 
   MicOff, 
-  CheckCircle2, 
-  Circle, 
-  Plus, 
-  Trash2, 
-  Settings, 
-  ChevronRight,
+  CheckCircle2,
   Loader2,
   RefreshCw,
-  X
+  X,
+  Settings as SettingsIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI, Type } from "@google/genai";
 import Markdown from 'react-markdown';
 import { cn } from './lib/utils';
+import { createAIService } from './services/aiService';
+import { UserAPIConfig, STORAGE_KEYS, BaseListItem, DEFAULT_BASE_LIST } from './types/ai';
+import SettingsModal from './components/SettingsModal';
+import BaseListEditor from './components/BaseListEditor';
+import VoiceInputScreen from './components/VoiceInputScreen';
 
 // --- Types ---
 interface PackingItem {
@@ -38,8 +38,12 @@ interface UserInput {
 }
 
 // --- Constants ---
-const STORAGE_KEY_API_KEY = 'packwise_api_key';
-const STORAGE_KEY_LIST = 'packwise_current_list';
+const DEFAULT_API_CONFIG: UserAPIConfig = {
+  provider: 'gemini',
+  apiKey: '',
+  baseUrl: 'https://generativelanguage.googleapis.com',
+  model: 'gemini-2.0-flash',
+};
 
 // --- Components ---
 const GridIcon = ({ className }: { className?: string }) => (
@@ -52,81 +56,175 @@ const GridIcon = ({ className }: { className?: string }) => (
 
 export default function App() {
   // --- State ---
-  const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(STORAGE_KEY_API_KEY) || '');
-  const [showSettings, setShowSettings] = useState(!localStorage.getItem(STORAGE_KEY_API_KEY));
+  const [apiConfig, setApiConfig] = useState<UserAPIConfig>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.API_CONFIG);
+    return saved ? JSON.parse(saved) : DEFAULT_API_CONFIG;
+  });
+  const [showSettings, setShowSettings] = useState(() => !localStorage.getItem(STORAGE_KEYS.API_CONFIG));
   const [userInput, setUserInput] = useState<UserInput>({ who: '', where: '', duration: '', purpose: '' });
   const [isGenerating, setIsGenerating] = useState(false);
   const [packingList, setPackingList] = useState<PackingItem[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEY_LIST);
+    const saved = localStorage.getItem(STORAGE_KEYS.CURRENT_LIST);
     return saved ? JSON.parse(saved) : [];
   });
   const [isListening, setIsListening] = useState(false);
-  const [voiceText, setVoiceText] = useState('');
-  const [baseMarkdown, setBaseMarkdown] = useState('');
+  const [voiceTranscript, setVoiceTranscript] = useState('');
+  const [baseList, setBaseList] = useState<BaseListItem[]>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.BASE_LIST);
+    return saved ? JSON.parse(saved) : DEFAULT_BASE_LIST;
+  });
+  const [showBaseListEditor, setShowBaseListEditor] = useState(false);
   const [showBaseList, setShowBaseList] = useState(false);
   const [view, setView] = useState<'form' | 'list'>('form');
   const [error, setError] = useState<string | null>(null);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [newItemText, setNewItemText] = useState('');
 
-  // --- Handlers ---
+  // --- Refs ---
   const recognitionRef = useRef<any>(null);
 
   // --- Effects ---
+  // 持久化清单数据
   useEffect(() => {
-    fetch('/base-packing-list.md')
-      .then(res => res.text())
-      .then(setBaseMarkdown)
-      .catch(err => console.error('Failed to load base markdown:', err));
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_LIST, JSON.stringify(packingList));
+    localStorage.setItem(STORAGE_KEYS.CURRENT_LIST, JSON.stringify(packingList));
   }, [packingList]);
 
+  // 持久化 API 配置
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.API_CONFIG, JSON.stringify(apiConfig));
+  }, [apiConfig]);
+
+  // 持久化基础清单
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.BASE_LIST, JSON.stringify(baseList));
+  }, [baseList]);
+
+  // 错误提示自动消失
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => {
+        setError(null);
+      }, 3000); // 3秒后自动关闭
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
+  // 初始化语音识别
   useEffect(() => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = false;
-      recognitionRef.current.lang = 'zh-CN';
-
-      recognitionRef.current.onresult = (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        setVoiceText(transcript);
-        handleVoiceInput(transcript);
-        setIsListening(false);
-      };
-
-      recognitionRef.current.onerror = (event: any) => {
-        console.error('Speech recognition error', event.error);
-        setIsListening(false);
-      };
-
-      recognitionRef.current.onend = () => {
-        setIsListening(false);
-      };
+    
+    if (!SpeechRecognition) {
+      console.warn('浏览器不支持语音识别');
+      return;
     }
+
+    recognitionRef.current = new SpeechRecognition();
+    recognitionRef.current.continuous = true; // 支持连续识别
+    recognitionRef.current.interimResults = true; // 显示中间结果
+    recognitionRef.current.lang = 'zh-CN';
+    recognitionRef.current.maxAlternatives = 1;
+
+    recognitionRef.current.onresult = (event: any) => {
+      let finalTranscript = '';
+      let interimTranscript = '';
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript;
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+
+      console.log('语音识别结果:', { finalTranscript, interimTranscript });
+      
+      // 更新实时显示 - 优先显示最终结果
+      if (finalTranscript) {
+        setVoiceTranscript(finalTranscript);
+      } else if (interimTranscript) {
+        setVoiceTranscript(interimTranscript);
+      }
+    };
+
+    recognitionRef.current.onerror = (event: any) => {
+      console.error('语音识别错误:', event.error, event);
+          
+      // 常见错误处理
+      if (event.error === 'not-allowed') {
+        alert('请允许麦克风权限后重试\n\n设置方法:\n1. 点击地址栏左侧的 🔒 图标\n2. 选择"网站设置"\n3. 将麦克风改为"允许"');
+        setIsListening(false);
+      } else if (event.error === 'no-speech') {
+        console.log('未检测到语音,请对着麦克风说话');
+        // no-speech 不关闭录音,继续等待用户说话
+        // 但如果连续多次 no-speech,可能需要用户手动停止
+      } else if (event.error === 'network') {
+        alert('网络连接失败,请检查网络\n\nChrome 语音识别需要联网使用 Google 服务器');
+        setIsListening(false);
+      } else if (event.error === 'aborted') {
+        console.log('语音识别已中止');
+      } else {
+        console.warn('语音识别错误:', event.error);
+      }
+    };
+
+    recognitionRef.current.onend = () => {
+      console.log('语音识别结束');
+      // 如果是因为 no-speech 自动结束,且用户还在录音状态,尝试重启
+      if (isListening) {
+        console.log('检测到自动结束,尝试重启语音识别...');
+        setTimeout(() => {
+          if (isListening && recognitionRef.current) {
+            try {
+              recognitionRef.current.start();
+              console.log('语音识别已重启');
+            } catch (e) {
+              console.log('重启失败:', e);
+            }
+          }
+        }, 100);
+      } else {
+        setIsListening(false);
+      }
+    };
+
+    recognitionRef.current.onstart = () => {
+      console.log('语音识别开始');
+    };
+
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+    };
   }, []);
 
-  const handleSaveApiKey = (key: string) => {
-    setApiKey(key);
-    localStorage.setItem(STORAGE_KEY_API_KEY, key);
+  const handleSaveApiConfig = (config: UserAPIConfig) => {
+    setApiConfig(config);
     setShowSettings(false);
   };
 
   const toggleListening = () => {
     if (isListening) {
+      console.log('停止录音');
       recognitionRef.current?.stop();
     } else {
-      setVoiceText('');
+      console.log('开始录音');
+      setVoiceTranscript('');
       recognitionRef.current?.start();
       setIsListening(true);
     }
   };
 
-  const handleVoiceInput = async (text: string) => {
-    if (!apiKey) {
+  const confirmVoiceInput = async () => {
+    if (!voiceTranscript.trim()) {
+      setIsListening(false);
+      return;
+    }
+
+    setIsListening(false);
+    
+    if (!apiConfig.apiKey) {
       alert('请先设置 API Key');
       setShowSettings(true);
       return;
@@ -134,32 +232,23 @@ export default function App() {
 
     setIsGenerating(true);
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `用户说: "${text}"。请从中提取以下信息：去哪里(where)、和谁去(who)、待多久(duration)、做什么(purpose)。
-        请以 JSON 格式返回。如果信息缺失，请留空。`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              where: { type: Type.STRING },
-              who: { type: Type.STRING },
-              duration: { type: Type.STRING },
-              purpose: { type: Type.STRING },
-            }
-          }
-        }
-      });
+      const aiService = createAIService(apiConfig);
+      const response = await aiService.generateJSON<any>(`
+        用户说: "${voiceTranscript}"。请从中提取以下信息：去哪里(where)、和谁去(who)、待多久(duration)、做什么(purpose)。
+        请以 JSON 格式返回。如果信息缺失，请留空。
+      `);
 
-      const extracted = JSON.parse(response.text);
       setUserInput(prev => ({
-        where: extracted.where || prev.where,
-        who: extracted.who || prev.who,
-        duration: extracted.duration || prev.duration,
-        purpose: extracted.purpose || prev.purpose,
+        where: response.where || prev.where,
+        who: response.who || prev.who,
+        duration: response.duration || prev.duration,
+        purpose: response.purpose || prev.purpose,
       }));
+
+      // 自动跳转到清单生成
+      if (response.where && response.who && response.duration && response.purpose) {
+        setTimeout(() => generateList(), 500);
+      }
     } catch (error) {
       console.error('Voice parsing failed:', error);
       setError('语音解析失败，请重试。');
@@ -168,8 +257,14 @@ export default function App() {
     }
   };
 
+  const cancelVoiceInput = () => {
+    setIsListening(false);
+    setVoiceTranscript('');
+    recognitionRef.current?.stop();
+  };
+
   const generateList = async () => {
-    if (!apiKey) {
+    if (!apiConfig.apiKey) {
       setError('请先在设置中配置 API Key');
       setShowSettings(true);
       return;
@@ -183,12 +278,18 @@ export default function App() {
     setIsGenerating(true);
     setError(null);
     try {
-      const ai = new GoogleGenAI({ apiKey });
+      const aiService = createAIService(apiConfig);
+      
+      // 将基础清单转换为文本格式
+      const baseListText = baseList
+        .map(item => `- [${item.category}] ${item.text}`)
+        .join('\n');
+      
       const prompt = `
         你是一个专业的旅行助手。基于以下基础清单和用户的旅行信息，生成一个定制化的打包清单。
         
-        基础清单:
-        ${baseMarkdown}
+        基础清单(用户的常备物品):
+        ${baseListText}
         
         旅行信息:
         - 目的地: ${userInput.where}
@@ -196,7 +297,12 @@ export default function App() {
         - 持续时间: ${userInput.duration}
         - 旅行目的: ${userInput.purpose}
         
-        请考虑目的地的天气、文化、旅行时长和活动。
+        请根据旅行场景对基础清单进行调整:
+        1. 保留基础清单中适用的物品
+        2. 添加旅行必需的新物品
+        3. 移除不适用的物品
+        4. 考虑目的地天气、文化、活动等因素
+        
         返回一个 JSON 数组，每个元素包含:
         - id: 唯一标识符 (string)
         - text: 物品名称 (string)
@@ -204,37 +310,17 @@ export default function App() {
         - completed: false (boolean)
       `;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                id: { type: Type.STRING },
-                text: { type: Type.STRING },
-                category: { type: Type.STRING },
-                completed: { type: Type.BOOLEAN },
-              },
-              required: ["id", "text", "category", "completed"]
-            }
-          }
-        }
-      });
-
-      if (!response.text) {
-        throw new Error('AI 返回内容为空');
+      const newList = await aiService.generateJSON<PackingItem[]>(prompt);
+      
+      if (!newList || !Array.isArray(newList)) {
+        throw new Error('AI 返回的数据格式不正确');
       }
 
-      const newList = JSON.parse(response.text);
       setPackingList(newList);
       setView('list');
     } catch (error) {
       console.error('Generation failed:', error);
-      setError('生成失败，请检查 API Key 或网络。');
+      setError(`生成失败: ${error instanceof Error ? error.message : '请检查 API 配置或网络'}`);
     } finally {
       setIsGenerating(false);
     }
@@ -257,9 +343,7 @@ export default function App() {
     setShowResetConfirm(false);
   };
 
-  const [newItemText, setNewItemText] = useState('');
-
-  const addItem = (e: React.FormEvent) => {
+  const addItem = useCallback((e: React.FormEvent) => {
     e.preventDefault();
     if (!newItemText.trim()) return;
     const newItem: PackingItem = {
@@ -270,9 +354,9 @@ export default function App() {
     };
     setPackingList(prev => [...prev, newItem]);
     setNewItemText('');
-  };
+  }, [newItemText]);
 
-  const categories = Array.from(new Set(packingList.map(item => item.category)));
+  const categories = useMemo(() => Array.from(new Set(packingList.map(item => item.category))), [packingList]);
 
   return (
     <div className="min-h-screen bg-[#F5F5F5] text-[#1A1A1A] font-sans selection:bg-black selection:text-white flex flex-col">
@@ -294,7 +378,7 @@ export default function App() {
                     placeholder="谁"
                     value={userInput.who}
                     onChange={e => setUserInput(prev => ({ ...prev, who: e.target.value }))}
-                    className="text-4xl font-bold bg-transparent border-none p-0 focus:ring-0 placeholder:text-gray-300 w-full"
+                    className="text-4xl font-bold bg-transparent border-none outline-none p-0 m-0 placeholder:text-gray-300 w-full caret-black"
                   />
                 </div>
                 <div className="flex items-baseline gap-2">
@@ -304,7 +388,7 @@ export default function App() {
                     placeholder="哪里"
                     value={userInput.where}
                     onChange={e => setUserInput(prev => ({ ...prev, where: e.target.value }))}
-                    className="text-4xl font-bold bg-transparent border-none p-0 focus:ring-0 placeholder:text-gray-300 w-full"
+                    className="text-4xl font-bold bg-transparent border-none outline-none p-0 m-0 placeholder:text-gray-300 w-full caret-black"
                   />
                 </div>
                 <div className="flex items-baseline gap-2">
@@ -314,7 +398,7 @@ export default function App() {
                     placeholder="多久"
                     value={userInput.duration}
                     onChange={e => setUserInput(prev => ({ ...prev, duration: e.target.value }))}
-                    className="text-4xl font-bold bg-transparent border-none p-0 focus:ring-0 placeholder:text-gray-300 w-full"
+                    className="text-4xl font-bold bg-transparent border-none outline-none p-0 m-0 placeholder:text-gray-300 w-full caret-black"
                   />
                 </div>
                 <div className="flex items-baseline gap-2">
@@ -324,13 +408,20 @@ export default function App() {
                     placeholder="什么"
                     value={userInput.purpose}
                     onChange={e => setUserInput(prev => ({ ...prev, purpose: e.target.value }))}
-                    className="text-4xl font-bold bg-transparent border-none p-0 focus:ring-0 placeholder:text-gray-300 w-full"
+                    className="text-4xl font-bold bg-transparent border-none outline-none p-0 m-0 placeholder:text-gray-300 w-full caret-black"
                   />
                 </div>
-                <div className="text-4xl font-bold">需要带</div>
-                <div className="flex items-center gap-2">
-                  <span className="text-4xl font-bold">什么</span>
-                  <span className="text-4xl">👀</span>
+                <div className="flex items-center gap-2 mt-8">
+                  <button 
+                    onClick={generateList}
+                    disabled={isGenerating}
+                    className={cn(
+                      "bg-black text-white text-4xl font-bold px-8 py-4 rounded-2xl transition-all hover:bg-black/80 active:scale-95",
+                      isGenerating && "opacity-50 cursor-not-allowed"
+                    )}
+                  >
+                  带什么
+                  </button>
                 </div>
               </div>
 
@@ -342,41 +433,39 @@ export default function App() {
               )}
 
               {error && (
-                <div className="p-4 bg-red-50 text-red-600 rounded-xl text-sm border border-red-100 flex justify-between items-center">
-                  <span>{error}</span>
-                  <button onClick={() => setError(null)} className="p-1 hover:bg-red-100 rounded">
+                <motion.div
+                  initial={{ opacity: 0, y: -50 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -50 }}
+                  className="fixed top-6 left-1/2 -translate-x-1/2 z-[100] bg-red-500 text-white px-6 py-3 rounded-2xl shadow-lg flex items-center gap-3"
+                >
+                  <span className="font-medium">{error}</span>
+                  <button 
+                    onClick={() => setError(null)} 
+                    className="p-1 hover:bg-red-600 rounded-full transition-colors"
+                  >
                     <X className="w-4 h-4" />
                   </button>
-                </div>
+                </motion.div>
               )}
 
               {/* Bottom Controls */}
               <div className="absolute bottom-12 left-8 right-8 flex items-center justify-between">
-                <button onClick={() => setShowSettings(true)}>
-                  <GridIcon />
+                {/* 左下角: 语音输入 */}
+                <button 
+                  onClick={toggleListening}
+                  className={cn(
+                    "w-12 h-12 rounded-full flex items-center justify-center transition-all",
+                    isListening ? "bg-black text-white" : "bg-white border border-black/5"
+                  )}
+                >
+                  {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                 </button>
-                
-                <div className="flex items-center gap-4">
-                  <button 
-                    onClick={toggleListening}
-                    className={cn(
-                      "w-12 h-12 rounded-full flex items-center justify-center transition-all",
-                      isListening ? "bg-black text-white" : "bg-white border border-black/5"
-                    )}
-                  >
-                    {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-                  </button>
-                  <button 
-                    onClick={generateList}
-                    disabled={isGenerating}
-                    className={cn(
-                      "w-12 h-12 rounded-full bg-black text-white flex items-center justify-center transition-opacity",
-                      isGenerating && "opacity-50 cursor-not-allowed"
-                    )}
-                  >
-                    <ChevronRight className="w-6 h-6" />
-                  </button>
-                </div>
+
+                {/* 右下角: 设置 */}
+                <button onClick={() => setShowSettings(true)} className="w-12 h-12 flex items-center justify-center">
+                  <SettingsIcon className="w-6 h-6" />
+                </button>
               </div>
             </motion.div>
           ) : (
@@ -501,81 +590,35 @@ export default function App() {
       </AnimatePresence>
       <AnimatePresence>
         {showSettings && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
-          >
-            <motion.div 
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
-              className="bg-white w-full max-w-md rounded-[2rem] p-8 shadow-2xl space-y-6"
-            >
-              <div className="space-y-2">
-                <h3 className="text-2xl font-bold tracking-tight">API 设置</h3>
-                <p className="text-gray-400 text-sm">请输入您的 Gemini API Key 以启用智能清单功能。</p>
-              </div>
-
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Gemini API Key</label>
-                  <input 
-                    type="password"
-                    placeholder="在此输入 API Key..."
-                    defaultValue={apiKey}
-                    onBlur={(e) => handleSaveApiKey(e.target.value)}
-                    className="w-full bg-[#F5F5F5] border-none rounded-2xl px-4 py-4 focus:ring-2 focus:ring-black/5 transition-all"
-                  />
-                </div>
-              </div>
-
-              <button 
-                onClick={() => setShowSettings(false)}
-                className="w-full bg-black text-white rounded-2xl py-4 font-bold hover:bg-black/90 transition-all"
-              >
-                保存并关闭
-              </button>
-              <button 
-                onClick={() => setShowBaseList(true)}
-                className="w-full text-gray-400 text-sm font-medium"
-              >
-                查看基础清单
-              </button>
-            </motion.div>
-          </motion.div>
+          <SettingsModal
+            config={apiConfig}
+            onSave={handleSaveApiConfig}
+            onClose={() => setShowSettings(false)}
+            onViewBaseList={() => {
+              setShowSettings(false);
+              setShowBaseListEditor(true);
+            }}
+          />
         )}
       </AnimatePresence>
 
-      {/* Base List Modal */}
+      {/* 语音输入全屏界面 */}
       <AnimatePresence>
-        {showBaseList && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
-            onClick={() => setShowBaseList(false)}
-          >
-            <motion.div 
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
-              className="bg-white w-full max-w-lg rounded-[2rem] p-8 shadow-2xl space-y-6 max-h-[80vh] overflow-y-auto"
-              onClick={e => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between">
-                <h3 className="text-2xl font-bold">基础清单</h3>
-                <button onClick={() => setShowBaseList(false)} className="p-2 hover:bg-gray-100 rounded-full">
-                  <X className="w-6 h-6" />
-                </button>
-              </div>
-              <div className="prose prose-sm max-w-none prose-headings:font-bold prose-headings:tracking-tight">
-                <Markdown>{baseMarkdown}</Markdown>
-              </div>
-            </motion.div>
-          </motion.div>
+        {isListening && (
+          <VoiceInputScreen
+            transcript={voiceTranscript}
+            isListening={isListening}
+            onConfirm={confirmVoiceInput}
+            onCancel={cancelVoiceInput}
+            isGenerating={isGenerating}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* 基础清单编辑器 */}
+      <AnimatePresence>
+        {showBaseListEditor && (
+          <BaseListEditor onClose={() => setShowBaseListEditor(false)} />
         )}
       </AnimatePresence>
     </div>
